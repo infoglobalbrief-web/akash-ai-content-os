@@ -1,13 +1,22 @@
-
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import Boolean, DateTime, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
-from typing import Any
-
-from sqlalchemy import Integer, JSON
 
 
 class Source(Base):
@@ -17,79 +26,89 @@ class Source(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     url: Mapped[str] = mapped_column(String(2048), unique=True, nullable=False)
     source_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    is_active: Mapped[bool] = mapped_column(
-        Boolean, default=True, nullable=False
-    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
+    scan_interval_minutes: Mapped[int] = mapped_column(
+        Integer, default=360, server_default=text("360"), nullable=False
     )
+    last_scanned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_scan_status: Mapped[str] = mapped_column(
+        String(20), default="never", server_default=text("'never'"), nullable=False
+    )
+    last_scan_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_scan_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
 
 class BackgroundJob(Base):
     __tablename__ = "background_jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-
-    job_type: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-        index=True,
-    )
-
-    payload: Mapped[dict[str, Any]] = mapped_column(
-        JSON,
-        nullable=False,
-        default=dict,
-    )
-
+    job_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(
-        String(20),
-        nullable=False,
-        default="queued",
-        index=True,
+        String(20), nullable=False, default="queued", index=True
     )
-
-    attempts: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        default=0,
-    )
-
-    max_attempts: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        default=5,
-    )
-
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     available_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-        index=True,
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
-
     locked_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
+        DateTime(timezone=True), nullable=True
     )
-
-    last_error: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+
+class DiscoveredItem(Base):
+    __tablename__ = "discovered_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id", "item_key", name="uq_discovered_items_source_item"
+        ),
+        Index("ix_discovered_items_first_seen_at", "first_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    source_id: Mapped[int] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    item_key: Mapped[str] = mapped_column(String(2048), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_changed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    change_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    raw_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'::json")
     )
