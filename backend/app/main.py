@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
-from app.models import BackgroundJob, DiscoveredItem, Source
+from app.models import BackgroundJob, ContentDraft, DiscoveredItem, Source
 from app.queue_service import enqueue_job
 from app.security import require_api_key
 
@@ -40,6 +40,18 @@ class ClassifyPendingRequest(BaseModel):
 
 class DiscoveryReviewRequest(BaseModel):
     reviewed: bool
+
+
+class ContentDraftCreateRequest(BaseModel):
+    discovery_ids: list[int] = Field(min_length=1, max_length=8)
+    title_hint: str | None = Field(default=None, min_length=3, max_length=150)
+    audience: str = Field(default="AI professionals, creators, and digital marketers", min_length=3, max_length=200)
+    tone: Literal["professional", "conversational", "technical", "beginner_friendly"] = "professional"
+
+
+class ContentDraftReviewRequest(BaseModel):
+    decision: Literal["approve", "reject", "request_changes"]
+    review_notes: str | None = Field(default=None, max_length=5000)
 
 
 class SourceUpdateRequest(BaseModel):
@@ -445,3 +457,218 @@ def intelligence_summary(
         "by_category": [{"category": key, "count": count} for key, count in by_category],
         "by_event_type": [{"event_type": key, "count": count} for key, count in by_event_type],
     }
+
+
+# ---------------------------------------------------------
+# Content drafting, SEO checks, and explicit human approval
+# ---------------------------------------------------------
+
+def content_draft_to_dict(draft: ContentDraft, include_content: bool = False) -> dict[str, Any]:
+    result = {
+        "id": draft.id,
+        "status": draft.status,
+        "title": draft.title,
+        "slug": draft.slug,
+        "seo_title": draft.seo_title,
+        "meta_description": draft.meta_description,
+        "focus_keyword": draft.focus_keyword,
+        "discovery_ids": draft.discovery_ids,
+        "word_count": draft.word_count,
+        "seo_score": draft.seo_score,
+        "seo_checks": draft.seo_checks,
+        "generation_method": draft.generation_method,
+        "generation_error": draft.generation_error,
+        "review_notes": draft.review_notes,
+        "approved_at": draft.approved_at,
+        "created_at": draft.created_at,
+        "updated_at": draft.updated_at,
+    }
+    if include_content:
+        result["content_markdown"] = draft.content_markdown
+        result["evidence_snapshot"] = draft.evidence_snapshot
+        result["request_options"] = draft.request_options
+    return result
+
+
+@app.post("/api/v1/content/drafts", status_code=202)
+def queue_content_draft(
+    request: ContentDraftCreateRequest,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Create a queued draft from classified discoveries; worker generates it."""
+    if len(set(request.discovery_ids)) != len(request.discovery_ids):
+        raise HTTPException(status_code=422, detail="discovery_ids must not contain duplicates.")
+
+    with SessionLocal() as session:
+        items = session.scalars(
+            select(DiscoveredItem).where(DiscoveredItem.id.in_(request.discovery_ids))
+        ).all()
+        by_id = {item.id: item for item in items}
+        missing = [item_id for item_id in request.discovery_ids if item_id not in by_id]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"Discovery IDs not found: {missing}")
+        unclassified = [item_id for item_id in request.discovery_ids if by_id[item_id].classification_status != "classified"]
+        if unclassified:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Classify these discoveries before drafting: {unclassified}",
+            )
+        draft = ContentDraft(
+            status="queued",
+            title=(request.title_hint or f"Draft from {len(request.discovery_ids)} discovery item(s)")[:500],
+            discovery_ids=request.discovery_ids,
+            request_options={
+                "title_hint": request.title_hint,
+                "audience": request.audience,
+                "tone": request.tone,
+            },
+            evidence_snapshot=[],
+            seo_checks={},
+        )
+        session.add(draft)
+        session.commit()
+        session.refresh(draft)
+        draft_id = draft.id
+
+    try:
+        job_id = enqueue_job(
+            job_type="content.generate",
+            payload={"draft_id": draft_id},
+            max_attempts=3,
+        )
+    except Exception as exc:
+        with SessionLocal() as session:
+            draft = session.get(ContentDraft, draft_id)
+            if draft is not None:
+                draft.status = "generation_error"
+                draft.generation_error = f"Could not enqueue generation job: {type(exc).__name__}"[:1000]
+                session.commit()
+        raise HTTPException(status_code=503, detail="Draft was created but generation could not be queued.") from None
+
+    return {
+        "draft_id": draft_id,
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Content generation queued. Draft requires human review and will not be published automatically.",
+    }
+
+
+@app.get("/api/v1/content/drafts")
+def list_content_drafts(
+    status: Literal["queued", "generating", "needs_review", "approved", "rejected", "changes_requested", "generation_error"] | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    statement = select(ContentDraft)
+    if status is not None:
+        statement = statement.where(ContentDraft.status == status)
+    statement = statement.order_by(ContentDraft.created_at.desc(), ContentDraft.id.desc()).offset(offset).limit(limit)
+    with SessionLocal() as session:
+        drafts = session.scalars(statement).all()
+        items = [content_draft_to_dict(draft) for draft in drafts]
+    return {"count": len(items), "limit": limit, "offset": offset, "items": items}
+
+
+@app.get("/api/v1/content/drafts/{draft_id}")
+def get_content_draft(
+    draft_id: int,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    with SessionLocal() as session:
+        draft = session.get(ContentDraft, draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Content draft not found.")
+        return content_draft_to_dict(draft, include_content=True)
+
+
+@app.post("/api/v1/content/drafts/{draft_id}/regenerate", status_code=202)
+def regenerate_content_draft(
+    draft_id: int,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    with SessionLocal() as session:
+        draft = session.get(ContentDraft, draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Content draft not found.")
+        if draft.status in {"approved", "rejected", "queued", "generating"}:
+            raise HTTPException(status_code=409, detail=f"Draft cannot be regenerated while status is '{draft.status}'.")
+        draft.status = "queued"
+        draft.generation_error = None
+        session.commit()
+
+    try:
+        job_id = enqueue_job("content.generate", {"draft_id": draft_id}, max_attempts=3)
+    except Exception:
+        with SessionLocal() as session:
+            draft = session.get(ContentDraft, draft_id)
+            if draft is not None:
+                draft.status = "generation_error"
+                draft.generation_error = "Could not enqueue regeneration job."
+                session.commit()
+        raise HTTPException(status_code=503, detail="Regeneration could not be queued.") from None
+    return {"draft_id": draft_id, "job_id": job_id, "status": "queued", "message": "Regeneration queued for review; nothing will be published automatically."}
+
+
+@app.patch("/api/v1/content/drafts/{draft_id}/review")
+def review_content_draft(
+    draft_id: int,
+    request: ContentDraftReviewRequest,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Explicit human decision. Approval is not publishing."""
+    from datetime import datetime, timezone
+
+    with SessionLocal() as session:
+        draft = session.get(ContentDraft, draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Content draft not found.")
+        if draft.status not in {"needs_review", "changes_requested"}:
+            raise HTTPException(status_code=409, detail=f"Draft cannot be reviewed while status is '{draft.status}'.")
+        if request.decision == "approve":
+            if not (draft.content_markdown or "").strip() or not (draft.evidence_snapshot or []):
+                raise HTTPException(status_code=409, detail="Draft must contain content and evidence before approval.")
+            draft.status = "approved"
+            draft.approved_at = datetime.now(timezone.utc)
+        elif request.decision == "reject":
+            draft.status = "rejected"
+            draft.approved_at = None
+        else:
+            draft.status = "changes_requested"
+            draft.approved_at = None
+        draft.review_notes = request.review_notes
+        session.commit()
+        session.refresh(draft)
+        result = content_draft_to_dict(draft)
+
+    result["message"] = (
+        "Draft marked approved. This action does not publish it."
+        if request.decision == "approve" else
+        "Draft rejected." if request.decision == "reject" else
+        "Changes requested; edit the request or regenerate before another review."
+    )
+    return result
+
+
+@app.get("/api/v1/content/summary")
+def content_summary(_: None = Depends(require_api_key)) -> dict[str, Any]:
+    with SessionLocal() as session:
+        total = session.scalar(select(func.count()).select_from(ContentDraft)) or 0
+        status_rows = session.execute(
+            select(ContentDraft.status, func.count())
+            .group_by(ContentDraft.status)
+            .order_by(func.count().desc())
+        ).all()
+        needs_review = session.scalar(
+            select(func.count()).select_from(ContentDraft).where(ContentDraft.status == "needs_review")
+        ) or 0
+        approved = session.scalar(
+            select(func.count()).select_from(ContentDraft).where(ContentDraft.status == "approved")
+        ) or 0
+    return {
+        "total_drafts": total,
+        "needs_human_review": needs_review,
+        "approved_not_published": approved,
+        "by_status": [{"status": status, "count": count} for status, count in status_rows],
+    }
+

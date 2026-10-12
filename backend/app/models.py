@@ -146,3 +146,51 @@ class DiscoveredItem(Base):
     classified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class ContentDraft(Base):
+    """Human-reviewed content draft generated from traceable discoveries."""
+    __tablename__ = "content_drafts"
+    __table_args__ = (
+        Index("ix_content_drafts_status_created_at", "status", "created_at"),
+        Index("ix_content_drafts_seo_score", "seo_score"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(30), default="queued", server_default=text("'queued'"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    slug: Mapped[str | None] = mapped_column(String(220), nullable=True)
+    seo_title: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    meta_description: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    focus_keyword: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    content_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discovery_ids: Mapped[list[int]] = mapped_column(
+        JSON, default=list, server_default=text("'[]'::json"), nullable=False
+    )
+    evidence_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, server_default=text("'[]'::json"), nullable=False
+    )
+    request_options: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default=text("'{}'::json"), nullable=False
+    )
+    word_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    seo_score: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    seo_checks: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default=text("'{}'::json"), nullable=False
+    )
+    generation_method: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    generation_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

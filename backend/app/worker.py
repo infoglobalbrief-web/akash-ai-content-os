@@ -10,6 +10,7 @@ from app.queue_service import (
 )
 from app.source_monitor import enqueue_due_source_scans, scan_source
 from app.intelligence import classify_pending_discoveries
+from app.content_pipeline import generate_content_draft
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,10 +71,19 @@ def handle_intelligence_classify_pending(payload: dict[str, Any]) -> None:
     )
 
 
+def handle_content_generate(payload: dict[str, Any]) -> None:
+    draft_id = payload.get("draft_id")
+    if not isinstance(draft_id, int) or isinstance(draft_id, bool) or draft_id < 1:
+        raise ValueError("content.generate payload must include a positive integer draft_id.")
+    result = generate_content_draft(draft_id)
+    logging.info("Content draft generated: %s", result)
+
+
 HANDLERS: dict[str, JobHandler] = {
     "demo.echo": handle_demo_echo,
     "source.scan": handle_source_scan,
     "intelligence.classify_pending": handle_intelligence_classify_pending,
+    "content.generate": handle_content_generate,
 }
 
 
