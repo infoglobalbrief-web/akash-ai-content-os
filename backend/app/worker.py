@@ -9,6 +9,7 @@ from app.queue_service import (
     recover_stale_jobs,
 )
 from app.source_monitor import enqueue_due_source_scans, scan_source
+from app.intelligence import classify_pending_discoveries
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,11 +38,42 @@ def handle_source_scan(payload: dict[str, Any]) -> None:
         result.get("changed_count", 0),
         result.get("unchanged_count", 0),
     )
+    if result.get("status") == "success":
+        triage = classify_pending_discoveries(source_id=source_id, limit=100)
+        logging.info(
+            "Discovery triage: source_id=%s selected=%s classified=%s errors=%s",
+            source_id,
+            triage.get("selected", 0),
+            triage.get("classified", 0),
+            triage.get("errors", 0),
+        )
+
+
+def handle_intelligence_classify_pending(payload: dict[str, Any]) -> None:
+    source_id = payload.get("source_id")
+    discovery_id = payload.get("discovery_id")
+    limit = payload.get("limit", 100)
+    if source_id is not None and (not isinstance(source_id, int) or isinstance(source_id, bool) or source_id < 1):
+        raise ValueError("source_id must be a positive integer when provided.")
+    if discovery_id is not None and (not isinstance(discovery_id, int) or isinstance(discovery_id, bool) or discovery_id < 1):
+        raise ValueError("discovery_id must be a positive integer when provided.")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        raise ValueError("limit must be an integer between 1 and 200.")
+    result = classify_pending_discoveries(
+        source_id=source_id,
+        limit=limit,
+        discovery_id=discovery_id,
+    )
+    logging.info(
+        "Intelligence classification batch: selected=%s classified=%s errors=%s",
+        result.get("selected", 0), result.get("classified", 0), result.get("errors", 0),
+    )
 
 
 HANDLERS: dict[str, JobHandler] = {
     "demo.echo": handle_demo_echo,
     "source.scan": handle_source_scan,
+    "intelligence.classify_pending": handle_intelligence_classify_pending,
 }
 
 

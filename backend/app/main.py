@@ -2,7 +2,7 @@ from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
@@ -12,7 +12,7 @@ from app.security import require_api_key
 
 app = FastAPI(
     title="Akash AI Content OS API",
-    version="0.2.0",
+    version="0.3.0",
     description="Backend API for AI content research and automation.",
 )
 
@@ -31,6 +31,15 @@ class SourceCreateRequest(BaseModel):
     source_type: SourceType
     description: str | None = Field(default=None, max_length=2000)
     scan_interval_minutes: int = Field(default=360, ge=5, le=10080)
+
+
+class ClassifyPendingRequest(BaseModel):
+    source_id: int | None = Field(default=None, ge=1)
+    limit: int = Field(default=100, ge=1, le=200)
+
+
+class DiscoveryReviewRequest(BaseModel):
+    reviewed: bool
 
 
 class SourceUpdateRequest(BaseModel):
@@ -237,15 +246,44 @@ def queue_source_scan(source_id: int, _: None = Depends(require_api_key)) -> dic
 
 @app.get("/api/v1/discoveries")
 def list_discoveries(
-    source_id: int | None = None,
+    source_id: int | None = Query(default=None, ge=1),
+    category: str | None = Query(default=None, max_length=50),
+    event_type: str | None = Query(default=None, max_length=80),
+    classification_status: Literal["pending", "classified", "error"] | None = None,
+    needs_review: bool | None = None,
+    min_relevance: int = Query(default=0, ge=0, le=100),
+    min_importance: int = Query(default=0, ge=0, le=100),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _: None = Depends(require_api_key),
 ) -> dict[str, Any]:
+    """List and filter source discoveries by classification and triage priority."""
     statement = select(DiscoveredItem)
     if source_id is not None:
         statement = statement.where(DiscoveredItem.source_id == source_id)
-    statement = statement.order_by(DiscoveredItem.first_seen_at.desc(), DiscoveredItem.id.desc()).offset(offset).limit(limit)
+    if category is not None:
+        statement = statement.where(DiscoveredItem.category == category)
+    if event_type is not None:
+        statement = statement.where(DiscoveredItem.event_type == event_type)
+    if classification_status is not None:
+        statement = statement.where(DiscoveredItem.classification_status == classification_status)
+    if needs_review is not None:
+        statement = statement.where(DiscoveredItem.needs_review.is_(needs_review))
+    if min_relevance:
+        statement = statement.where(DiscoveredItem.relevance_score >= min_relevance)
+    if min_importance:
+        statement = statement.where(DiscoveredItem.importance_score >= min_importance)
+
+    statement = (
+        statement.order_by(
+            DiscoveredItem.relevance_score.desc(),
+            DiscoveredItem.importance_score.desc(),
+            DiscoveredItem.first_seen_at.desc(),
+            DiscoveredItem.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
     with SessionLocal() as session:
         discoveries = session.scalars(statement).all()
         items = [
@@ -262,7 +300,148 @@ def list_discoveries(
                 "last_changed_at": item.last_changed_at,
                 "change_count": item.change_count,
                 "raw_metadata": item.raw_metadata,
+                "category": item.category,
+                "event_type": item.event_type,
+                "provider_name": item.provider_name,
+                "relevance_score": item.relevance_score,
+                "importance_score": item.importance_score,
+                "classification_status": item.classification_status,
+                "classification_method": item.classification_method,
+                "classification_summary": item.classification_summary,
+                "classification_reason": item.classification_reason,
+                "keywords": item.keywords,
+                "needs_review": item.needs_review,
+                "classified_at": item.classified_at,
             }
             for item in discoveries
         ]
     return {"count": len(items), "limit": limit, "offset": offset, "items": items}
+
+
+@app.post("/api/v1/intelligence/classify-pending", status_code=202)
+def queue_classification(
+    request: ClassifyPendingRequest,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Queue a batch classification job; the worker performs the processing."""
+    if request.source_id is not None:
+        with SessionLocal() as session:
+            if session.get(Source, request.source_id) is None:
+                raise HTTPException(status_code=404, detail="Source not found.")
+
+    job_id = enqueue_job(
+        job_type="intelligence.classify_pending",
+        payload={"source_id": request.source_id, "limit": request.limit},
+        max_attempts=3,
+    )
+    return {
+        "id": job_id,
+        "job_type": "intelligence.classify_pending",
+        "status": "queued",
+        "source_id": request.source_id,
+        "limit": request.limit,
+        "message": "Discovery classification queued.",
+    }
+
+
+@app.post("/api/v1/discoveries/{discovery_id}/classify", status_code=202)
+def queue_one_classification(
+    discovery_id: int,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Queue one discovery for classification if it is still pending."""
+    with SessionLocal() as session:
+        discovery = session.get(DiscoveredItem, discovery_id)
+        if discovery is None:
+            raise HTTPException(status_code=404, detail="Discovery not found.")
+        if discovery.classification_status == "classified":
+            return {"id": discovery.id, "status": "already_classified", "message": "This discovery is already classified."}
+        if discovery.classification_status == "error":
+            # Allow a user-requested retry to re-enter the pending queue.
+            discovery.classification_status = "pending"
+            discovery.classification_method = None
+            discovery.classification_reason = None
+            session.commit()
+
+    job_id = enqueue_job(
+        job_type="intelligence.classify_pending",
+        payload={"discovery_id": discovery_id, "limit": 1},
+        max_attempts=3,
+    )
+    return {"id": job_id, "job_type": "intelligence.classify_pending", "status": "queued", "discovery_id": discovery_id}
+
+
+@app.patch("/api/v1/discoveries/{discovery_id}/review")
+def update_discovery_review(
+    discovery_id: int,
+    request: DiscoveryReviewRequest,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Mark a triage item reviewed or put it back in the review queue."""
+    with SessionLocal() as session:
+        item = session.get(DiscoveredItem, discovery_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Discovery not found.")
+        item.needs_review = not request.reviewed
+        session.commit()
+        return {
+            "id": item.id,
+            "reviewed": request.reviewed,
+            "needs_review": item.needs_review,
+            "message": "Review status updated. This does not publish or approve content.",
+        }
+
+
+@app.get("/api/v1/intelligence/summary")
+def intelligence_summary(
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Return discovery triage totals for the future admin dashboard."""
+    with SessionLocal() as session:
+        total = session.scalar(select(func.count()).select_from(DiscoveredItem)) or 0
+        pending = session.scalar(
+            select(func.count()).select_from(DiscoveredItem).where(
+                DiscoveredItem.classification_status == "pending"
+            )
+        ) or 0
+        classified = session.scalar(
+            select(func.count()).select_from(DiscoveredItem).where(
+                DiscoveredItem.classification_status == "classified"
+            )
+        ) or 0
+        errors = session.scalar(
+            select(func.count()).select_from(DiscoveredItem).where(
+                DiscoveredItem.classification_status == "error"
+            )
+        ) or 0
+        review_count = session.scalar(
+            select(func.count()).select_from(DiscoveredItem).where(
+                DiscoveredItem.needs_review.is_(True)
+            )
+        ) or 0
+        high_relevance = session.scalar(
+            select(func.count()).select_from(DiscoveredItem).where(
+                DiscoveredItem.relevance_score >= 70
+            )
+        ) or 0
+        by_category = session.execute(
+            select(DiscoveredItem.category, func.count())
+            .group_by(DiscoveredItem.category)
+            .order_by(func.count().desc())
+        ).all()
+        by_event_type = session.execute(
+            select(DiscoveredItem.event_type, func.count())
+            .group_by(DiscoveredItem.event_type)
+            .order_by(func.count().desc())
+        ).all()
+
+    return {
+        "total_discoveries": total,
+        "pending_classification": pending,
+        "classified": classified,
+        "classification_errors": errors,
+        "needs_review": review_count,
+        "high_relevance": high_relevance,
+        "by_category": [{"category": key, "count": count} for key, count in by_category],
+        "by_event_type": [{"event_type": key, "count": count} for key, count in by_event_type],
+    }

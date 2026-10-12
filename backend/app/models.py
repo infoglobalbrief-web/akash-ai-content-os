@@ -83,6 +83,9 @@ class DiscoveredItem(Base):
             "source_id", "item_key", name="uq_discovered_items_source_item"
         ),
         Index("ix_discovered_items_first_seen_at", "first_seen_at"),
+        Index("ix_discovered_items_classification_status", "classification_status"),
+        Index("ix_discovered_items_category", "category"),
+        Index("ix_discovered_items_relevance_score", "relevance_score"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
@@ -111,4 +114,35 @@ class DiscoveredItem(Base):
     )
     raw_metadata: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict, server_default=text("'{}'::json")
+    )
+
+    # AI intelligence / triage fields. Existing discoveries are backfilled by
+    # database defaults and can then be classified in a batch.
+    category: Mapped[str] = mapped_column(
+        String(50), default="unclassified", server_default=text("'unclassified'"), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(80), default="general_update", server_default=text("'general_update'"), nullable=False
+    )
+    provider_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    relevance_score: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    importance_score: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    classification_status: Mapped[str] = mapped_column(
+        String(20), default="pending", server_default=text("'pending'"), nullable=False
+    )
+    classification_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    classification_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    classification_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    keywords: Mapped[list[str]] = mapped_column(
+        JSON, default=list, server_default=text("'[]'::json"), nullable=False
+    )
+    needs_review: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    classified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
