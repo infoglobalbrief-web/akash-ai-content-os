@@ -11,6 +11,7 @@ from app.queue_service import (
 from app.source_monitor import enqueue_due_source_scans, scan_source
 from app.intelligence import classify_pending_discoveries
 from app.content_pipeline import generate_content_draft
+from app.wordpress_publisher import publish_approved_draft
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,11 +80,20 @@ def handle_content_generate(payload: dict[str, Any]) -> None:
     logging.info("Content draft generated: %s", result)
 
 
+def handle_wordpress_publish(payload: dict[str, Any]) -> None:
+    publication_id = payload.get("publication_id")
+    if not isinstance(publication_id, int) or isinstance(publication_id, bool) or publication_id < 1:
+        raise ValueError("wordpress.publish payload must include a positive integer publication_id.")
+    result = publish_approved_draft(publication_id)
+    logging.info("WordPress publication result: %s", result)
+
+
 HANDLERS: dict[str, JobHandler] = {
     "demo.echo": handle_demo_echo,
     "source.scan": handle_source_scan,
     "intelligence.classify_pending": handle_intelligence_classify_pending,
     "content.generate": handle_content_generate,
+    "wordpress.publish": handle_wordpress_publish,
 }
 
 

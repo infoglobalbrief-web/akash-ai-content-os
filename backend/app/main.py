@@ -6,13 +6,14 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
-from app.models import BackgroundJob, ContentDraft, DiscoveredItem, Source
+from app.models import BackgroundJob, ContentDraft, DiscoveredItem, Source, WordPressPublication
 from app.queue_service import enqueue_job
 from app.security import require_api_key
+from app.wordpress_publisher import check_wordpress_connection
 
 app = FastAPI(
     title="Akash AI Content OS API",
-    version="0.3.0",
+    version="0.4.0",
     description="Backend API for AI content research and automation.",
 )
 
@@ -555,7 +556,7 @@ def queue_content_draft(
 
 @app.get("/api/v1/content/drafts")
 def list_content_drafts(
-    status: Literal["queued", "generating", "needs_review", "approved", "rejected", "changes_requested", "generation_error"] | None = None,
+    status: Literal["queued", "generating", "needs_review", "approved", "published", "rejected", "changes_requested", "generation_error"] | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _: None = Depends(require_api_key),
@@ -672,3 +673,212 @@ def content_summary(_: None = Depends(require_api_key)) -> dict[str, Any]:
         "by_status": [{"status": status, "count": count} for status, count in status_rows],
     }
 
+
+
+# ---------------------------------------------------------
+# WordPress publishing integration (explicit, approved drafts only)
+# ---------------------------------------------------------
+
+class WordPressPublishRequest(BaseModel):
+    status: Literal["draft", "publish"] = "draft"
+    category_ids: list[int] = Field(default_factory=list, max_length=50)
+    tag_ids: list[int] = Field(default_factory=list, max_length=50)
+
+
+def wordpress_publication_to_dict(publication: WordPressPublication) -> dict[str, Any]:
+    return {
+        "id": publication.id,
+        "draft_id": publication.draft_id,
+        "requested_status": publication.requested_status,
+        "status": publication.status,
+        "wp_post_id": publication.wp_post_id,
+        "wp_post_url": publication.wp_post_url,
+        "wp_edit_url": publication.wp_edit_url,
+        "wp_slug": publication.wp_slug,
+        "category_ids": publication.category_ids or [],
+        "tag_ids": publication.tag_ids or [],
+        "attempts": publication.attempts,
+        "last_error": publication.last_error,
+        "created_at": publication.created_at,
+        "updated_at": publication.updated_at,
+        "published_at": publication.published_at,
+    }
+
+
+@app.get("/api/v1/wordpress/connection")
+def wordpress_connection_status(
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Check WordPress REST authentication without creating or changing a post."""
+    try:
+        return check_wordpress_connection()
+    except Exception as exc:
+        # The publisher sanitizes upstream errors; do not reveal environment values.
+        raise HTTPException(
+            status_code=503,
+            detail=f"WordPress connection test failed: {str(exc)[:500]}",
+        ) from None
+
+
+@app.post("/api/v1/content/drafts/{draft_id}/publish", status_code=202)
+def queue_wordpress_publication(
+    draft_id: int,
+    request: WordPressPublishRequest,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """Queue an approved draft for WordPress; defaults to a non-public WP draft."""
+    if any(value < 1 for value in request.category_ids + request.tag_ids):
+        raise HTTPException(status_code=422, detail="Category and tag IDs must be positive integers.")
+    if len(set(request.category_ids)) != len(request.category_ids):
+        raise HTTPException(status_code=422, detail="category_ids must not contain duplicates.")
+    if len(set(request.tag_ids)) != len(request.tag_ids):
+        raise HTTPException(status_code=422, detail="tag_ids must not contain duplicates.")
+
+    with SessionLocal() as session:
+        draft = session.scalar(
+            select(ContentDraft)
+            .where(ContentDraft.id == draft_id)
+            .with_for_update()
+        )
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Content draft not found.")
+
+        publication = session.scalar(
+            select(WordPressPublication)
+            .where(WordPressPublication.draft_id == draft_id)
+            .with_for_update()
+        )
+
+        # Idempotent repeated request after a successful action.
+        if publication is not None:
+            if publication.status == "published" and request.status == "publish":
+                return {
+                    "publication_id": publication.id,
+                    "draft_id": draft_id,
+                    "status": publication.status,
+                    "wp_post_id": publication.wp_post_id,
+                    "wp_post_url": publication.wp_post_url,
+                    "message": "This draft is already published; no duplicate was queued.",
+                }
+            if publication.status == "wordpress_draft" and request.status == "draft":
+                return {
+                    "publication_id": publication.id,
+                    "draft_id": draft_id,
+                    "status": publication.status,
+                    "wp_post_id": publication.wp_post_id,
+                    "wp_post_url": publication.wp_post_url,
+                    "message": "This WordPress draft already exists; no duplicate was queued.",
+                }
+            if publication.status == "published" and request.status == "draft":
+                raise HTTPException(
+                    status_code=409,
+                    detail="This draft is already publicly published; a request to downgrade it is blocked.",
+                )
+            if publication.status in {"queued", "publishing"}:
+                if publication.requested_status != request.status:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A publication is already in progress with a different WordPress status.",
+                    )
+                return {
+                    "publication_id": publication.id,
+                    "draft_id": draft_id,
+                    "status": publication.status,
+                    "message": "A publication job is already queued or running.",
+                }
+
+        if draft.status != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only explicitly approved drafts can be sent to WordPress (current status: {draft.status}).",
+            )
+        if not (draft.content_markdown or "").strip() or not (draft.evidence_snapshot or []):
+            raise HTTPException(
+                status_code=409,
+                detail="Draft must contain content and evidence before WordPress publishing.",
+            )
+
+        if publication is None:
+            publication = WordPressPublication(
+                draft_id=draft_id,
+                requested_status=request.status,
+                status="queued",
+                category_ids=request.category_ids,
+                tag_ids=request.tag_ids,
+                idempotency_key=f"akcos-content-draft-{draft_id}",
+            )
+            session.add(publication)
+        else:
+            publication.requested_status = request.status
+            publication.status = "queued"
+            publication.category_ids = request.category_ids
+            publication.tag_ids = request.tag_ids
+            publication.last_error = None
+
+        session.commit()
+        session.refresh(publication)
+        publication_id = publication.id
+
+    try:
+        job_id = enqueue_job(
+            job_type="wordpress.publish",
+            payload={"publication_id": publication_id},
+            max_attempts=3,
+        )
+    except Exception:
+        with SessionLocal() as session:
+            publication = session.get(WordPressPublication, publication_id)
+            if publication is not None:
+                publication.status = "failed"
+                publication.last_error = "Could not enqueue WordPress publishing job."
+                session.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Publication record created but the worker job could not be queued.",
+        ) from None
+
+    return {
+        "publication_id": publication_id,
+        "draft_id": draft_id,
+        "job_id": job_id,
+        "status": "queued",
+        "requested_wordpress_status": request.status,
+        "message": (
+            "WordPress publication queued. Human approval was required; "
+            "WordPress status defaults to draft unless explicitly set to publish."
+        ),
+    }
+
+
+@app.get("/api/v1/wordpress/publications")
+def list_wordpress_publications(
+    status: Literal["queued", "publishing", "wordpress_draft", "published", "failed"] | None = None,
+    draft_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    statement = select(WordPressPublication)
+    if status is not None:
+        statement = statement.where(WordPressPublication.status == status)
+    if draft_id is not None:
+        statement = statement.where(WordPressPublication.draft_id == draft_id)
+    statement = statement.order_by(
+        WordPressPublication.created_at.desc(), WordPressPublication.id.desc()
+    ).offset(offset).limit(limit)
+    with SessionLocal() as session:
+        rows = session.scalars(statement).all()
+        items = [wordpress_publication_to_dict(row) for row in rows]
+    return {"count": len(items), "limit": limit, "offset": offset, "items": items}
+
+
+@app.get("/api/v1/wordpress/publications/{publication_id}")
+def get_wordpress_publication(
+    publication_id: int,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    with SessionLocal() as session:
+        publication = session.get(WordPressPublication, publication_id)
+        if publication is None:
+            raise HTTPException(status_code=404, detail="WordPress publication not found.")
+        return wordpress_publication_to_dict(publication)
